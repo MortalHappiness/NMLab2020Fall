@@ -2,6 +2,7 @@
 
 import argparse
 import hashlib
+import shelve
 import time
 
 # ========================================
@@ -63,63 +64,97 @@ class Block:
     def genesis_block(cls):
         return cls("Genesis block", "", 0)
 
+    def __str__(self):
+        D = {"Height": self.height,
+             "Prev Block Hash": self.prev_block_hash,
+             "Time": self.time,
+             "Data": self.data,
+             "Hash": self.hash,
+             "Nonce": self.nonce
+             }
+        return "\n".join([f"{k}: {v}" for k, v in D.items()])
+
 
 class Blockchain:
     def __init__(self):
-        self.blocks = [Block.genesis_block()]
+        with shelve.open("blocks") as db:
+            try:
+                tip = db["l"]
+            except KeyError:
+                genesis = Block.genesis_block()
+                db[genesis.hash] = genesis
+                db["l"] = genesis.hash
+                tip = genesis.hash
+
+        self.tip = tip
 
     def add_block(self, data):
-        prev_block = self.blocks[-1]
-        new_block = Block(data, prev_block.hash, prev_block.height)
-        self.blocks.append(new_block)
+        with shelve.open("blocks") as db:
+            last_hash = db["l"]
+            last_block = db[last_hash]
+            new_block = Block(data, last_hash, last_block.height)
+            db[new_block.hash] = new_block
+            db["l"] = new_block.hash
+            self.tip = new_block.hash
 
 
-# ========================================
+class CLI:
+    blockchain = Blockchain()
 
+    @classmethod
+    def addblock(cls, args):
+        if (args.transaction is None):
+            print("Please specify the transaction!")
+            return
+        cls.blockchain.add_block(args.transaction)
+        print("Success!")
 
-def addblock(args):
-    pass
+    @classmethod
+    def printchain(cls, args):
+        with shelve.open("blocks") as db:
+            current_hash = db["l"]
+            while current_hash:
+                block = db[current_hash]
+                print(block)
+                POW = ProofOfWork(block)
+                print("PoW:", POW.validate())
+                print()
+                current_hash = block.prev_block_hash
 
-
-def printchain(args):
-    pass
-
-
-def printblock(args):
-    pass
-
+    @classmethod
+    def printblock(cls, args):
+        if (args.height is None):
+            print("Please specify the height!")
+            return
+        with shelve.open("blocks") as db:
+            current_hash = db["l"]
+            while current_hash:
+                block = db[current_hash]
+                if block.height == args.height:
+                    print(block)
+                    POW = ProofOfWork(block)
+                    print("PoW:", POW.validate())
+                    return
+                current_hash = block.prev_block_hash
+        print("No block with such height found!")
 
 # ========================================
 
 
 if __name__ == '__main__':
-    blockchain = Blockchain()
-    blockchain.add_block("123 456")
-    blockchain.add_block("hello")
-
-    for block in blockchain.blocks:
-        print("Prev. hash:", block.prev_block_hash)
-        print("Data:", block.data)
-        print("Hash:", block.hash)
-        POW = ProofOfWork(block)
-        print("PoW:", POW.validate())
-        print()
-
-    exit()
-
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparser = subparsers.add_parser("addblock")
     subparser.add_argument("--transaction")
-    subparser.set_defaults(func=addblock)
+    subparser.set_defaults(func=CLI.addblock)
 
     subparser = subparsers.add_parser("printchain")
-    subparser.set_defaults(func=printchain)
+    subparser.set_defaults(func=CLI.printchain)
 
     subparser = subparsers.add_parser("printblock")
     subparser.add_argument("--height", type=int)
-    subparser.set_defaults(func=printblock)
+    subparser.set_defaults(func=CLI.printblock)
 
     args = parser.parse_args()
     args.func(args)
