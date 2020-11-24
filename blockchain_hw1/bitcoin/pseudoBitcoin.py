@@ -4,7 +4,12 @@ import argparse
 import hashlib
 import pickle
 import shelve
+import sys
 import time
+
+import base58
+from Crypto.PublicKey import ECC
+from Crypto.Util.number import long_to_bytes
 
 # ========================================
 
@@ -49,7 +54,7 @@ class Blockchain:
                 print("No existing blockchain found. Creating a new one...")
                 if address is None:
                     print("Please specify the address!")
-                    exit(1)
+                    sys.exit(1)
                 genesis_coinbase_data = "Genesis Block"
                 cbtx = Transaction.coinbaseTX(address, genesis_coinbase_data)
                 genesis = Block.genesis_block(cbtx)
@@ -68,7 +73,7 @@ class Blockchain:
             db["l"] = new_block.hash
             self.tip = new_block.hash
 
-    def find_unspent_transactions(self, address):
+    def find_unspent_transactions(self, pub_key_hash):
         unspentTXOs = list()
         spentTXOs = dict()
 
@@ -82,12 +87,12 @@ class Blockchain:
                         if txid in spentTXOs and out_idx in spentTXOs[txid]:
                             continue
 
-                        if vout.can_be_unlocked_with(address):
+                        if vout.is_locked_with_key(pub_key_hash):
                             unspentTXOs.append(tx)
 
                     if not tx.is_coinbase():
                         for vin in tx.vins:
-                            if vin.can_unlock_output_with(address):
+                            if vin.uses_key(pub_key_hash):
                                 in_txid = vin.txid.encode().hex()
                                 spentTXOs.setdefault(
                                     in_txid, set()).add(vin.vout)
@@ -96,24 +101,25 @@ class Blockchain:
 
         return unspentTXOs
 
-    def findUTXO(self, address):
+    def findUTXO(self, pub_key_hash):
         UTXOs = list()
-        unspentTXs = self.find_unspent_transactions(address)
+        unspentTXs = self.find_unspent_transactions(pub_key_hash)
         for tx in unspentTXs:
             for vout in tx.vouts:
-                if vout.can_be_unlocked_with(address):
+                if vout.is_locked_with_key(pub_key_hash):
                     UTXOs.append(vout)
 
         return UTXOs
 
-    def find_spendable_outputs(self, address, amount):
+    def find_spendable_outputs(self, pub_key_hash, amount):
         unspent_outputs = dict()
-        unspentTXs = self.find_unspent_transactions(address)
+        unspentTXs = self.find_unspent_transactions(pub_key_hash)
         accumulated = 0
         for tx in unspentTXs:
             txid = tx.id.encode().hex()
             for out_idx, out in enumerate(tx.vouts):
-                if out.can_be_unlocked_with(address) and accumulated < amount:
+                if (out.is_locked_with_key(pub_key_hash) and
+                        accumulated < amount):
                     accumulated += out.value
                     unspent_outputs.setdefault(txid, list()).append(out_idx)
                     if accumulated >= amount:
@@ -166,22 +172,28 @@ class ProofOfWork:
 
 
 class TXInput:
-    def __init__(self, txid, vout, script_sig):
+    def __init__(self, txid, vout, signature, pub_key):
         self.txid = txid
         self.vout = vout
-        self.script_sig = script_sig
+        self.signature = signature
+        self.pub_key = pub_key
 
-    def can_unlock_output_with(self, unlocking_data):
-        return self.script_sig == unlocking_data
+    def uses_key(self, pub_key_hash):
+        locking_hash = Util.hash_pub_key(self.pub_key)
+        return locking_hash == pub_key_hash
 
 
 class TXOutput:
-    def __init__(self, value, script_pub_key):
+    def __init__(self, value, address):
         self.value = value
-        self.script_pub_key = script_pub_key
+        self.pub_key_hash = None
+        self.lock(address)
 
-    def can_be_unlocked_with(self, unlocking_data):
-        return self.script_pub_key == unlocking_data
+    def lock(self, address):
+        self.pub_key_hash = Util.address_to_pubkeyhash(address)
+
+    def is_locked_with_key(self, pub_key_hash):
+        return self.pub_key_hash == pub_key_hash
 
 
 class Transaction:
@@ -197,7 +209,7 @@ class Transaction:
 
         subsidy = 10
 
-        txin = TXInput("", -1, data)
+        txin = TXInput("", -1, None, data)
         txout = TXOutput(subsidy, user_to)
         tx = cls(None, [txin], [txout])
         tx.set_id()
@@ -214,17 +226,26 @@ class Transaction:
         inputs = list()
         outputs = list()
 
+        with shelve.open("wallets") as db:
+            try:
+                wallets = db["wallets"]
+                wallet = wallets[user_from]
+            except KeyError:
+                print("ERROR: No such wallet!")
+                sys.exit(1)
+
+        pub_key_hash = Util.hash_pub_key(wallet.public_key)
         acc, valid_outputs = blockchain.find_spendable_outputs(
-            user_from, amount)
+            pub_key_hash, amount)
 
         if acc < amount:
             print("ERROR: Not enough funds")
-            exit(1)
+            sys.exit(1)
 
         for txid, outs in valid_outputs.items():
             txid = bytes.fromhex(txid).decode()
             for out in outs:
-                inputs.append(TXInput(txid, out, user_from))
+                inputs.append(TXInput(txid, out, None, wallet.public_key))
 
         outputs.append(TXOutput(amount, user_to))
         if acc > amount:
@@ -241,11 +262,83 @@ class Transaction:
 
 # ========================================
 
+class Wallet:
+    def __init__(self):
+        private_key = ECC.generate(curve="P-256")
+        public_key = (long_to_bytes(private_key.pointQ.x) +
+                      long_to_bytes(private_key.pointQ.y)
+                      )
+        self.private_key = private_key.export_key(format="PEM")
+        self.public_key = public_key
+
+        with shelve.open("wallets") as db:
+            wallets = db.get("wallets", dict())
+            wallets[self.get_address().decode()] = self
+            db["wallets"] = wallets
+
+    def get_address(self):
+        pub_key_hash = Util.hash_pub_key(self.public_key)
+
+        version = bytes([0])
+        versioned_payload = version + pub_key_hash
+        checksum = Util.checksum(versioned_payload)
+
+        full_payload = versioned_payload + checksum
+        address = base58.b58encode(full_payload)
+
+        return address
+
+
+# ========================================
+
+class Constant:
+    address_checksum_len = 4
+
+
+class Util:
+    @staticmethod
+    def hash_pub_key(pub_key):
+        pub_sha256 = hashlib.sha256(pub_key).digest()
+        ripemd160 = hashlib.new("ripemd160")
+        ripemd160.update(pub_sha256)
+        return ripemd160.digest()
+
+    @staticmethod
+    def checksum(payload):
+        first_sha = hashlib.sha256(payload).digest()
+        second_sha = hashlib.sha256(first_sha).digest()
+
+        return second_sha[:Constant.address_checksum_len]
+
+    @staticmethod
+    def validate_address(address):
+        pub_key_hash = base58.b58decode(address.encode())
+        actual_checksum = pub_key_hash[-Constant.address_checksum_len:]
+        version = pub_key_hash[0:1]
+        pub_key_hash = pub_key_hash[1:-Constant.address_checksum_len]
+        target_checksum = Util.checksum(version + pub_key_hash)
+        return actual_checksum == target_checksum
+
+    @staticmethod
+    def address_to_pubkeyhash(address):
+        return (
+            base58.b58decode(address.encode())[1:-Constant.address_checksum_len]
+        )
+
+# ========================================
+
 
 class CLI:
+    def createwallet(self, args):
+        wallet = Wallet()
+        print("Your new address:", wallet.get_address().decode())
+
     def createblockchain(self, args):
         if args.address is None:
             print("Please specify the address!")
+            return
+        if not Util.validate_address(args.address):
+            print("ERROR: Address is not valid")
             return
         Blockchain(args.address)
         print("Done!")
@@ -254,8 +347,12 @@ class CLI:
         if args.address is None:
             print("Please specify the address!")
             return
+        if not Util.validate_address(args.address):
+            print("ERROR: Address is not valid")
+            return
         blockchain = Blockchain()
-        UTXOs = blockchain.findUTXO(args.address)
+        pub_key_hash = Util.address_to_pubkeyhash(args.address)
+        UTXOs = blockchain.findUTXO(pub_key_hash)
         balance = sum([out.value for out in UTXOs])
         print(f"Balance of '{args.address}': {balance}")
 
@@ -311,6 +408,9 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    subparser = subparsers.add_parser("createwallet")
+    subparser.set_defaults(func=cli.createwallet)
 
     subparser = subparsers.add_parser("createblockchain")
     subparser.add_argument("--address")
