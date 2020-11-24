@@ -80,7 +80,7 @@ class Blockchain:
             self.tip = new_block.hash
 
     def find_unspent_transactions(self, pub_key_hash):
-        unspentTXOs = list()
+        unspentTXOs = set()
         spentTXOs = dict()
 
         current_hash = self.tip
@@ -94,7 +94,7 @@ class Blockchain:
                             continue
 
                         if vout.is_locked_with_key(pub_key_hash):
-                            unspentTXOs.append(tx)
+                            unspentTXOs.add(tx)
 
                     if not tx.is_coinbase():
                         for vin in tx.vins:
@@ -105,7 +105,7 @@ class Blockchain:
 
                 current_hash = block.prev_block_hash
 
-        return unspentTXOs
+        return list(unspentTXOs)
 
     def findUTXO(self, pub_key_hash):
         UTXOs = list()
