@@ -8,7 +8,9 @@ import sys
 import time
 
 import base58
+from Crypto.Hash import SHA256
 from Crypto.PublicKey import ECC
+from Crypto.Signature import DSS
 from Crypto.Util.number import long_to_bytes
 
 # ========================================
@@ -55,7 +57,7 @@ class Blockchain:
                 if address is None:
                     print("Please specify the address!")
                     sys.exit(1)
-                genesis_coinbase_data = "Genesis Block"
+                genesis_coinbase_data = b"Genesis Block"
                 cbtx = Transaction.coinbaseTX(address, genesis_coinbase_data)
                 genesis = Block.genesis_block(cbtx)
                 db[genesis.hash] = genesis
@@ -65,6 +67,10 @@ class Blockchain:
         self.tip = tip
 
     def mine_block(self, transactions):
+        for tx in transactions:
+            if not self.verify_transactions(tx):
+                raise ValueError("Invalid transaction")
+
         with shelve.open("blocks") as db:
             last_hash = db.get("l", None)
             last_block = db[last_hash]
@@ -127,6 +133,36 @@ class Blockchain:
 
         return accumulated, unspent_outputs
 
+    def find_transaction(self, txid):
+        current_hash = self.tip
+        with shelve.open("blocks") as db:
+            while current_hash:
+                block = db[current_hash]
+                for tx in block.transactions:
+                    if tx.id == txid:
+                        return tx
+                current_hash = block.prev_block_hash
+
+        raise ValueError("Transaction is not found")
+
+    def sign_transaction(self, tx, private_key):
+        prevTXs = dict()
+
+        for vin in tx.vins:
+            prevTX = self.find_transaction(vin.txid)
+            prevTXs[prevTX.id.encode().hex()] = prevTX
+
+        tx.sign(private_key, prevTXs)
+
+    def verify_transactions(self, tx):
+        prevTXs = dict()
+
+        for vin in tx.vins:
+            prevTX = self.find_transaction(vin.txid)
+            prevTXs[prevTX.id.encode().hex()] = prevTX
+
+        return tx.verify(prevTXs)
+
 # ========================================
 
 
@@ -184,10 +220,19 @@ class TXInput:
 
 
 class TXOutput:
-    def __init__(self, value, address):
+    def __init__(self, value, address=None, pub_key_hash=None):
         self.value = value
         self.pub_key_hash = None
-        self.lock(address)
+
+        if address is not None:
+            self.lock(address)
+            return
+
+        if pub_key_hash is not None:
+            self.pub_key_hash = pub_key_hash
+            return
+
+        raise ValueError("Both address and pub_key_hash are None")
 
     def lock(self, address):
         self.pub_key_hash = Util.address_to_pubkeyhash(address)
@@ -206,13 +251,14 @@ class Transaction:
     def coinbaseTX(cls, user_to, data=None):
         if data is None:
             data = f"Reward to '{user_to}'"
+            data = data.encode()
 
         subsidy = 10
 
-        txin = TXInput("", -1, None, data)
+        txin = TXInput(b"", -1, None, data)
         txout = TXOutput(subsidy, user_to)
         tx = cls(None, [txin], [txout])
-        tx.set_id()
+        tx.id = tx.hash()
 
         return tx
 
@@ -252,24 +298,77 @@ class Transaction:
             outputs.append(TXOutput(acc - amount, user_from))
 
         tx = cls(None, inputs, outputs)
-        tx.set_id()
+        tx.id = tx.hash()
+        private_key = ECC.import_key(wallet.private_key.decode())
+        blockchain.sign_transaction(tx, private_key)
 
         return tx
 
-    def set_id(self):
-        self.id = hashlib.sha256(pickle.dumps(self)).hexdigest()
+    def hash(self):
+        return hashlib.sha256(pickle.dumps(self)).hexdigest()
 
+    def sign(self, private_key, prevTXs):
+        if self.is_coinbase():
+            return
+
+        tx_copy = self.trimmed_copy()
+
+        for in_idx, vin in enumerate(tx_copy.vins):
+            prevTX = prevTXs[vin.txid.encode().hex()]
+            tx_copy.vins[in_idx].signature = None
+            tx_copy.vins[in_idx].pub_key = prevTX.vouts[vin.vout].pub_key_hash
+            tx_copy.id = tx_copy.hash()
+            tx_copy.vins[in_idx].pub_key = None
+
+            # sign
+            h = SHA256.new(tx_copy.id.encode())
+            signer = DSS.new(private_key, "fips-186-3")
+            signature = signer.sign(h)
+
+            self.vins[in_idx].signature = signature
+
+    def verify(self, prevTXs):
+        tx_copy = self.trimmed_copy()
+
+        for in_idx, vin in enumerate(self.vins):
+            prevTX = prevTXs[vin.txid.encode().hex()]
+            tx_copy.vins[in_idx].signature = None
+            tx_copy.vins[in_idx].pub_key = prevTX.vouts[vin.vout].pub_key_hash
+            tx_copy.id = tx_copy.hash()
+            tx_copy.vins[in_idx].pub_key = None
+
+            pub_key = ECC.import_key(vin.pub_key.decode())
+            h = SHA256.new(tx_copy.id.encode())
+            verifier = DSS.new(pub_key, "fips-186-3")
+            try:
+                verifier.verify(h, vin.signature)
+                return True
+            except ValueError:
+                return False
+
+    def trimmed_copy(self):
+        inputs = list()
+        outputs = list()
+
+        for vin in self.vins:
+            inputs.append(TXInput(vin.txid, vin.vout, None, None))
+
+        for vout in self.vouts:
+            outputs.append(TXOutput(vout.value, pub_key_hash=vout.pub_key_hash))
+
+        tx_copy = type(self)(self.id, inputs, outputs)
+
+        return tx_copy
 
 # ========================================
+
 
 class Wallet:
     def __init__(self):
         private_key = ECC.generate(curve="P-256")
-        public_key = (long_to_bytes(private_key.pointQ.x) +
-                      long_to_bytes(private_key.pointQ.y)
-                      )
-        self.private_key = private_key.export_key(format="PEM")
-        self.public_key = public_key
+        public_key = private_key.public_key()
+        self.private_key = private_key.export_key(format="PEM").encode()
+        self.public_key = public_key.export_key(format="PEM").encode()
 
         with shelve.open("wallets") as db:
             wallets = db.get("wallets", dict())
