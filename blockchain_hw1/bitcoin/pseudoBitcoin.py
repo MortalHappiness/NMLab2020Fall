@@ -68,7 +68,7 @@ class Blockchain:
 
     def mine_block(self, transactions):
         for tx in transactions:
-            if not self.verify_transactions(tx):
+            if not self.verify_transaction(tx):
                 raise ValueError("Invalid transaction")
 
         with shelve.open("blocks") as db:
@@ -154,7 +154,10 @@ class Blockchain:
 
         tx.sign(private_key, prevTXs)
 
-    def verify_transactions(self, tx):
+    def verify_transaction(self, tx):
+        if tx.is_coinbase():
+            return True
+
         prevTXs = dict()
 
         for vin in tx.vins:
@@ -264,7 +267,7 @@ class Transaction:
 
     def is_coinbase(self):
         return (len(self.vins) == 1 and
-                self.vins[0].txid == "" and
+                self.vins[0].txid == b"" and
                 self.vins[0].vout == -1)
 
     @classmethod
@@ -463,7 +466,8 @@ class CLI:
         blockchain = Blockchain()
         tx = Transaction.UTXOTransaction(
             args.user_from, args.user_to, args.amount, blockchain)
-        blockchain.mine_block([tx])
+        cbtx = Transaction.coinbaseTX(args.user_from, b"")
+        blockchain.mine_block([cbtx, tx])
         print("Success!")
 
     def printchain(self, args):
