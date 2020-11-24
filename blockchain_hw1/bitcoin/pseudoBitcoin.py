@@ -43,9 +43,9 @@ class Block:
         return "\n".join([f"{k}: {v}" for k, v in D.items()])
 
     def hash_transactions(self):
-        data = "".join([tx.id for tx in self.transactions])
-        tx_hash = hashlib.sha256(data.encode()).hexdigest()
-        return tx_hash
+        data_list = [tx.id.encode() for tx in self.transactions]
+        m_tree = MerkleTree(data_list)
+        return m_tree.root.data
 
 
 class Blockchain:
@@ -176,11 +176,11 @@ class ProofOfWork:
 
     def prepare_data(self, nonce):
         block = self.block
-        data = (block.prev_block_hash +
+        data = (block.prev_block_hash.encode() +
                 block.hash_transactions() +
-                hex(block.time)[2:] +
-                hex(block.bits)[2:] +
-                hex(nonce)[2:])
+                hex(block.time)[2:].encode() +
+                hex(block.bits)[2:].encode() +
+                hex(nonce)[2:].encode())
         return data
 
     def run(self):
@@ -189,7 +189,7 @@ class ProofOfWork:
         print("Mining a new block")
         while nonce < max_nonce:
             data = self.prepare_data(nonce)
-            hash_val = hashlib.sha256(data.encode()).hexdigest()
+            hash_val = hashlib.sha256(data).hexdigest()
             hash_int = int(hash_val, 16)
             if hash_int < self.target:
                 print(hash_val)
@@ -202,7 +202,7 @@ class ProofOfWork:
 
     def validate(self):
         data = self.prepare_data(self.block.nonce)
-        hash_val = hashlib.sha256(data.encode()).hexdigest()
+        hash_val = hashlib.sha256(data).hexdigest()
         hash_int = int(hash_val, 16)
 
         return hash_int < self.target
@@ -390,8 +390,45 @@ class Wallet:
 
         return address
 
+# ========================================
+
+
+class MerkleNode:
+    def __init__(self, left, right, data):
+        self.left = left
+        self.right = right
+
+        if left is None and right is None:
+            self.data = hashlib.sha256(data).digest()
+        elif right is None:
+            self.data = hashlib.sha256(left.data).digest()
+        else:
+            self.data = hashlib.sha256(left.data + right.data).digest()
+
+
+class MerkleTree:
+    def __init__(self, data_list):
+        nodes = list()
+        if len(data_list) % 2 != 0:
+            data_list = data_list + [data_list[-1]]
+
+        for data in data_list:
+            node = MerkleNode(None, None, data)
+            nodes.append(node)
+
+        while len(nodes) != 1:
+            new_level = list()
+            if len(nodes) % 2 != 0:
+                nodes.append(None)
+            for j in range(0, len(nodes), 2):
+                node = MerkleNode(nodes[j], nodes[j+1], None)
+                new_level.append(node)
+            nodes = new_level
+
+        self.root = nodes[0]
 
 # ========================================
+
 
 class Constant:
     address_checksum_len = 4
